@@ -1,0 +1,583 @@
+#!/usr/bin/env bash
+# demoreel-studio: install, update and start DemoReel Studio on a Mac (DR-64, docs/standalone/spec.md, ADR-0016).
+#
+# Source of truth: packages/launcher/demoreel-studio in the DemoReel repo. scripts/release-tap.sh copies it into the
+# Homebrew tap (tap/bin/). Plain bash 3.2, the /bin/bash macOS ships: no associative arrays, no mapfile, no ${x,,}.
+#
+# Everything lives under DEMOREEL_HOME (default ~/.demoreel):
+#   app/       an ordinary checkout of the private repo (renders/studio, secrets/studio.env and .venv-kokoro inside it)
+#   browsers/  Playwright's Chromium (PLAYWRIGHT_BROWSERS_PATH)
+#   pnpm/ cache/ data/ uv/   pnpm's store, tool caches and uv's Python, kept out of the rest of the home folder
+#   state/     what setup already did (lockfile and commit it installed and built)
+#   logs/      the full output of the last setup, update and Studio run
+#   run/       the URL of the running Studio (for `open`)
+set -euo pipefail
+
+LAUNCHER_VERSION="0.1.0"
+REPO_SSH="git@github.com:mschabowsky-cailum-blue/video-demo-creator.git"
+REPO_HTTPS="https://github.com/mschabowsky-cailum-blue/video-demo-creator.git"
+NO_ACCESS="Ask Matt for read access to the DemoReel repo, then run demoreel-studio setup again."
+
+DR_HOME="${DEMOREEL_HOME:-${HOME:-}/.demoreel}"
+APP="$DR_HOME/app"
+BROWSERS="$DR_HOME/browsers"
+STATE="$DR_HOME/state"
+LOGS="$DR_HOME/logs"
+RUN_DIR="$DR_HOME/run"
+URL_FILE="$RUN_DIR/studio.url"
+CONF="$DR_HOME/launcher.conf"
+SECRETS_DIR="$APP/secrets"
+SECRETS_FILE="$SECRETS_DIR/studio.env"
+LIBREOFFICE_APP="${DEMOREEL_LIBREOFFICE_APP:-/Applications/LibreOffice.app}"
+LOG_FILE=/dev/null
+KOKORO_OK=""
+
+# ---------------------------------------------------------------------------------------------------------------------
+# helpers
+
+say() { printf '%s\n' "$*"; }
+
+die() { printf '%s\n' "$*" >&2; exit 1; }
+
+usage_error() { printf '%s\n' "$*" >&2; exit 2; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# First line of a command's output, or nothing; never fails (sed reads everything, so no SIGPIPE under pipefail).
+first_line() { "$@" 2>/dev/null | sed -n 1p || true; }
+
+# "v22.11.0" -> "22"
+major_of() { printf '%s\n' "$1" | sed -E 's/^v?([0-9]+).*/\1/'; }
+
+# Octal permission bits of a file: GNU stat first, then BSD (macOS) stat.
+file_mode() { stat -c %a "$1" 2>/dev/null || stat -f %Lp "$1"; }
+
+# True when something accepts TCP connections on 127.0.0.1:<port> (bash's /dev/tcp; no nc or lsof needed).
+port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/$1") >/dev/null 2>&1; }
+
+in_app() { (cd "$APP" && "$@"); }
+
+conf_voice() {
+  if [ -f "$CONF" ]; then sed -n 's/^voice=//p' "$CONF" | sed -n '$p'; fi
+}
+
+set_conf_voice() { mkdir -p "$DR_HOME" && printf 'voice=%s\n' "$1" >"$CONF"; }
+
+is_checkout() { [ -d "$APP/.git" ]; }
+
+setup_complete() { is_checkout && [ -f "$STATE/setup-complete" ]; }
+
+built() { [ -f "$APP/apps/studio/dist/client/index.html" ] && [ -f "$APP/packages/engine/dist/index.js" ]; }
+
+chromium_present() { ls -d "$BROWSERS"/chromium-* >/dev/null 2>&1; }
+
+checkout_dirty() { [ -n "$(git -C "$APP" status --porcelain --untracked-files=no 2>/dev/null || true)" ]; }
+
+head_commit() { git -C "$APP" rev-parse --short HEAD 2>/dev/null || true; }
+
+key_present() {
+  [ -f "$SECRETS_FILE" ] && grep -Eq "^[[:space:]]*(export[[:space:]]+)?ANTHROPIC_API_KEY[[:space:]]*=[[:space:]]*[\"']?[^[:space:]\"']" "$SECRETS_FILE"
+}
+
+libreoffice_present() {
+  if [ -n "${DEMOREEL_SOFFICE:-}" ] && [ -x "${DEMOREEL_SOFFICE}" ]; then return 0; fi
+  have soffice || [ -d "$LIBREOFFICE_APP" ]
+}
+
+# Homebrew's keg-only node@22, its pnpm and ffmpeg-full go first on PATH; every tool cache stays under DEMOREEL_HOME.
+tool_env() {
+  local prefix=""
+  if have brew; then prefix="$(first_line brew --prefix)"; fi
+  if [ -n "$prefix" ] && [ -d "$prefix/opt/pnpm/bin" ]; then PATH="$prefix/opt/pnpm/bin:$PATH"; fi
+  if [ -n "$prefix" ] && [ -d "$prefix/opt/node@22/bin" ]; then PATH="$prefix/opt/node@22/bin:$PATH"; fi
+  # Homebrew's ffmpeg has no libass (no captions burn-in); its keg-only ffmpeg-full has, so it wins when installed.
+  if [ -n "$prefix" ] && [ -d "$prefix/opt/ffmpeg-full/bin" ]; then PATH="$prefix/opt/ffmpeg-full/bin:$PATH"; fi
+  export PATH
+  export PLAYWRIGHT_BROWSERS_PATH="$BROWSERS"
+  export PNPM_HOME="$DR_HOME/pnpm"
+  export XDG_CACHE_HOME="$DR_HOME/cache"
+  export XDG_DATA_HOME="$DR_HOME/data"
+  export UV_PYTHON_INSTALL_DIR="$DR_HOME/uv/python"
+  export TURBO_TELEMETRY_DISABLED=1
+  # Never wait on an SSH passphrase or host-key prompt: a failed SSH clone falls back to HTTPS.
+  export GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh -o BatchMode=yes -o ConnectTimeout=15}"
+}
+
+begin_log() {
+  mkdir -p "$LOGS"
+  LOG_FILE="$LOGS/$1.log"
+  printf 'demoreel-studio %s %s, %s\n' "$LAUNCHER_VERSION" "$1" "$(date)" >"$LOG_FILE"
+}
+
+# run_step <label> <fix> <command...>: one line with the result; on failure the log tail, the fix and the log path.
+run_step() {
+  local label=$1 fix=$2 t0=$SECONDS
+  shift 2
+  printf '%s ... ' "$label"
+  printf '\n== %s\n' "$label" >>"$LOG_FILE"
+  if "$@" >>"$LOG_FILE" 2>&1 </dev/null; then
+    say "done ($((SECONDS - t0)) s)."
+    return 0
+  fi
+  say "failed."
+  tail -n 15 "$LOG_FILE" | sed 's/^/    /' >&2
+  printf '%s\n' "$fix" >&2
+  printf 'The full log is %s.\n' "$LOG_FILE" >&2
+  exit 1
+}
+
+skip_step() { say "$1 ... $2."; }
+
+require_tools() {
+  local tool formula
+  for tool in node pnpm git; do
+    case "$tool" in node) formula="node@22" ;; *) formula="$tool" ;; esac
+    have "$tool" || die "$tool is not installed; run brew install $formula, then run demoreel-studio setup again."
+  done
+  local v
+  v="$(first_line node --version)"
+  if [ "$(major_of "$v")" != "22" ]; then
+    say "Node $v found; Studio is tested on Node 22, so run brew install node@22 if anything misbehaves."
+  fi
+}
+
+# ---------------------------------------------------------------------------------------------------------------------
+# setup pieces (shared with update)
+
+clone_repo() {
+  local branch=$1 url
+  local args=(clone)
+  if [ -n "$branch" ]; then args+=(--branch "$branch"); fi
+  if [ -n "${DEMOREEL_REPO_URL:-}" ]; then
+    git "${args[@]}" "$DEMOREEL_REPO_URL" "$APP"
+    return
+  fi
+  for url in "$REPO_SSH" "$REPO_HTTPS"; do
+    if git "${args[@]}" "$url" "$APP"; then return 0; fi
+    printf 'git clone %s failed\n' "$url"
+  done
+  return 1
+}
+
+switch_branch() { in_app git fetch origin "$1" && in_app git checkout "$1"; }
+
+ensure_checkout() {
+  local branch=$1
+  if is_checkout; then
+    if checkout_dirty; then
+      skip_step "Updating the DemoReel copy in $APP" "skipped, it has local changes"
+      return 0
+    fi
+    if [ -n "$branch" ] && [ "$(git -C "$APP" rev-parse --abbrev-ref HEAD 2>/dev/null || true)" != "$branch" ]; then
+      run_step "Switching the DemoReel copy to branch $branch" "Check the branch name, then run demoreel-studio setup --branch <name> again." switch_branch "$branch"
+    fi
+    printf 'Updating the DemoReel copy in %s ... ' "$APP"
+    printf '\n== git pull --ff-only\n' >>"$LOG_FILE"
+    if in_app git pull --ff-only >>"$LOG_FILE" 2>&1 </dev/null; then
+      say "done, now at $(head_commit)."
+    else
+      say "skipped, GitHub could not be reached or the copy has its own commits (see $LOG_FILE)."
+    fi
+  elif [ -e "$APP" ]; then
+    die "$APP exists but is not a DemoReel checkout; move it somewhere else, then run demoreel-studio setup again."
+  else
+    mkdir -p "$DR_HOME"
+    run_step "Cloning the DemoReel repo into $APP" "$NO_ACCESS" clone_repo "$branch"
+  fi
+}
+
+ensure_installed() {
+  if [ -f "$APP/node_modules/.modules.yaml" ] && cmp -s "$APP/pnpm-lock.yaml" "$STATE/installed-lock.yaml"; then
+    skip_step "Installing packages" "skipped, already installed"
+    return 0
+  fi
+  run_step "Installing packages with pnpm (a few minutes the first time)" "Check your network connection, then run demoreel-studio setup again." in_app pnpm install --frozen-lockfile
+  mkdir -p "$STATE" && cp "$APP/pnpm-lock.yaml" "$STATE/installed-lock.yaml"
+}
+
+ensure_built() {
+  local head
+  head="$(head_commit)"
+  if built && [ -f "$STATE/built-commit" ] && [ "$(cat "$STATE/built-commit")" = "$head" ]; then
+    skip_step "Building DemoReel" "skipped, already built at $head"
+    return 0
+  fi
+  run_step "Building DemoReel" "The build failed; send Matt the log named below." in_app pnpm build
+  mkdir -p "$STATE" && printf '%s\n' "$head" >"$STATE/built-commit"
+}
+
+ensure_chromium() {
+  if chromium_present && cmp -s "$APP/pnpm-lock.yaml" "$STATE/chromium-lock.yaml"; then
+    skip_step "Installing the Chromium browser" "skipped, already installed"
+    return 0
+  fi
+  mkdir -p "$BROWSERS"
+  run_step "Installing the Chromium browser into $BROWSERS" "Check your network connection, then run demoreel-studio setup again." in_app pnpm exec playwright install chromium
+  mkdir -p "$STATE" && cp "$APP/pnpm-lock.yaml" "$STATE/chromium-lock.yaml"
+}
+
+# pnpm setup:local --kokoro --check: the repo's own check of .venv-kokoro, its packages, weights and spaCy model.
+kokoro_ready() {
+  if [ "$KOKORO_OK" = "yes" ]; then return 0; fi
+  if in_app pnpm -s setup:local --kokoro --check >>"$LOG_FILE" 2>&1 </dev/null; then KOKORO_OK=yes; return 0; fi
+  return 1
+}
+
+ensure_kokoro() {
+  printf 'Checking the Kokoro voice ... '
+  if kokoro_ready; then
+    say "ready."
+  else
+    say "not set up yet."
+    run_step "Setting up the Kokoro voice (about 2 GB, several minutes)" "The voice setup failed; check your network connection and run demoreel-studio setup again, or run demoreel-studio setup --no-kokoro to skip the voice." in_app pnpm setup:local --kokoro --spacy-model
+    KOKORO_OK=yes
+  fi
+  set_conf_voice kokoro
+}
+
+save_key() {
+  local key=""
+  printf 'Paste your Claude API key and press Return (it is not shown), or just press Return to skip: '
+  if [ -t 0 ]; then IFS= read -r -s key || true; else IFS= read -r key || true; fi
+  printf '\n'
+  key="${key//[[:space:]]/}"
+  if [ -z "$key" ]; then
+    say "No key saved; Studio works without Claude, and running demoreel-studio setup again asks for it."
+    return 0
+  fi
+  (
+    umask 077
+    mkdir -p "$SECRETS_DIR"
+    if [ -s "$SECRETS_FILE" ] && [ -n "$(tail -c 1 "$SECRETS_FILE")" ]; then printf '\n' >>"$SECRETS_FILE"; fi
+    printf 'ANTHROPIC_API_KEY=%s\n' "$key" >>"$SECRETS_FILE"
+  )
+  chmod 700 "$SECRETS_DIR"
+  chmod 600 "$SECRETS_FILE"
+  case "$key" in
+    sk-ant-*) say "Claude key saved in $SECRETS_FILE, readable only by you." ;;
+    *) say "Key saved in $SECRETS_FILE, but Claude keys start with sk-ant-, so check it if Claude reports an error." ;;
+  esac
+}
+
+ensure_key() {
+  if key_present; then
+    chmod 600 "$SECRETS_FILE"
+    skip_step "Saving the Claude key" "skipped, $SECRETS_FILE already has one"
+  else
+    save_key
+  fi
+}
+
+# ---------------------------------------------------------------------------------------------------------------------
+# commands
+
+# shellcheck disable=SC2120 # the bare command calls it with no options; `setup` passes them
+cmd_setup() {
+  local no_kokoro=0 branch=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --no-kokoro) no_kokoro=1 ;;
+      --branch)
+        [ $# -ge 2 ] || usage_error "setup --branch needs a branch name."
+        branch=$2
+        shift
+        ;;
+      --branch=*) branch=${1#--branch=} ;;
+      *) usage_error "Unknown option $1 for setup; run demoreel-studio --help to see the options." ;;
+    esac
+    shift
+  done
+  tool_env
+  require_tools
+  begin_log setup
+  local t0=$SECONDS
+  say "Setting up DemoReel Studio in $DR_HOME."
+  ensure_checkout "$branch"
+  ensure_installed
+  ensure_built
+  ensure_chromium
+  if [ "$no_kokoro" = 1 ]; then
+    skip_step "Setting up the Kokoro voice" "skipped because of --no-kokoro"
+    if [ ! -d "$APP/.venv-kokoro" ]; then set_conf_voice none; fi
+  else
+    ensure_kokoro
+  fi
+  ensure_key
+  mkdir -p "$STATE" && printf '%s\n' "$(head_commit)" >"$STATE/setup-complete"
+  say "Setup finished in $((SECONDS - t0)) s; checking everything now."
+  say ""
+  doctor_report
+}
+
+cmd_update() {
+  [ $# -eq 0 ] || usage_error "update takes no options."
+  tool_env
+  is_checkout || die "DemoReel is not set up yet; run demoreel-studio setup first."
+  have git || die "git is not installed; run brew install git, then run demoreel-studio update again."
+  if checkout_dirty; then
+    die "Your copy in $APP has local changes, so update stopped; see them with git -C $APP status, commit or discard them, then run demoreel-studio update again."
+  fi
+  begin_log update
+  local old new
+  old="$(head_commit)"
+  run_step "Getting the latest DemoReel from GitHub" "The pull failed: GitHub could not be reached, your access is gone, or your copy has commits that are not on GitHub; the log says which." in_app git pull --ff-only
+  new="$(head_commit)"
+  ensure_installed
+  ensure_built
+  ensure_chromium
+  if [ "$(conf_voice)" != "none" ]; then
+    printf 'Checking the Kokoro voice ... '
+    if kokoro_ready; then say "ready."; else say "not ready, so run demoreel-studio setup to set it up again."; fi
+  fi
+  if [ "$old" = "$new" ]; then
+    say "Already up to date at $new."
+  else
+    say "Updated from $old to $new; the newest changes are:"
+    git -C "$APP" log --oneline "$old..$new" | sed -n '1,15p' | sed 's/^/  /'
+  fi
+}
+
+report() { # report <ok|missing|warn> <name> <detail>
+  printf '  %-7s  %-12s  %s\n' "$1" "$2" "$3"
+  if [ "$1" = "missing" ]; then DOCTOR_FAILED=1; fi
+}
+
+doctor_report() {
+  DOCTOR_FAILED=0
+  local v detail branch mode
+  say "DemoReel Studio doctor (launcher $LAUNCHER_VERSION, home $DR_HOME)"
+
+  if have node; then
+    v="$(first_line node --version)"
+    if [ "$(major_of "$v")" = "22" ]; then report ok node "$v"
+    else report warn node "$v; Studio is tested on Node 22. Fix: brew install node@22"; fi
+  else
+    report missing node "not installed. Fix: brew install node@22"
+  fi
+  if have pnpm; then report ok pnpm "$(first_line pnpm --version)"; else report missing pnpm "not installed. Fix: brew install pnpm"; fi
+  if have git; then report ok git "$(first_line git --version)"; else report missing git "not installed. Fix: brew install git"; fi
+  if have ffmpeg; then
+    report ok ffmpeg "$(first_line ffmpeg -version | sed -E 's/ Copyright.*//')"
+    if ffmpeg -hide_banner -filters 2>/dev/null | grep -Eq '^[[:space:]]*[^[:space:]]+[[:space:]]+subtitles[[:space:]]+V->V'; then
+      report ok captions "ffmpeg has the subtitles filter (libass)"
+    else
+      report warn captions "this ffmpeg has no libass, so captions are not burned in (the captions file is still made). Fix: brew install ffmpeg-full"
+    fi
+  else
+    report missing ffmpeg "not installed. Fix: brew install ffmpeg"
+    report warn captions "needs ffmpeg first"
+  fi
+  if have tesseract; then report ok tesseract "$(first_line tesseract --version)"
+  else report warn tesseract "not installed; app recordings need it for their text checks. Fix: brew install tesseract"; fi
+  if have uv; then report ok uv "$(first_line uv --version)"
+  else report warn uv "not installed; setting up the Kokoro voice needs it. Fix: brew install uv"; fi
+
+  if is_checkout && have git; then
+    branch="$(git -C "$APP" rev-parse --abbrev-ref HEAD 2>/dev/null || true)"
+    detail="$APP on ${branch:-an unknown branch} at $(head_commit)"
+    if checkout_dirty; then detail="$detail, with local changes"; fi
+    report ok checkout "$detail"
+  else
+    report missing checkout "$APP is not set up. Fix: demoreel-studio setup"
+  fi
+  if built; then report ok build "Studio and the engine are built"; else report missing build "not built. Fix: demoreel-studio setup"; fi
+  if chromium_present; then report ok chromium "Playwright's Chromium is in $BROWSERS"
+  else report missing chromium "not installed in $BROWSERS. Fix: demoreel-studio setup"; fi
+
+  if ! is_checkout || [ ! -f "$APP/node_modules/.modules.yaml" ]; then
+    report missing "kokoro voice" "needs the checkout and its packages first. Fix: demoreel-studio setup"
+  elif [ "$(conf_voice)" = "none" ] && [ ! -d "$APP/.venv-kokoro" ]; then
+    report warn "kokoro voice" "skipped by setup --no-kokoro, so narration needs another voice. Fix: demoreel-studio setup"
+  elif kokoro_ready; then
+    report ok "kokoro voice" "voice, weights and spaCy model present (pnpm setup:local --kokoro --check)"
+  else
+    report missing "kokoro voice" "not ready (pnpm setup:local --kokoro --check failed). Fix: demoreel-studio setup"
+  fi
+
+  if libreoffice_present; then report ok libreoffice "found"
+  else report warn libreoffice "not installed; only a PPTX without a PDF beside it needs it. Fix: brew install --cask libreoffice"; fi
+
+  if key_present; then
+    mode="$(file_mode "$SECRETS_FILE")"
+    if [ "$mode" = "600" ]; then report ok "claude key" "saved in $SECRETS_FILE, mode 600"
+    else report warn "claude key" "saved in $SECRETS_FILE but mode $mode lets others read it. Fix: chmod 600 $SECRETS_FILE"; fi
+  else
+    report warn "claude key" "not saved, so drafting with Claude is off. Fix: demoreel-studio setup"
+  fi
+
+  if have git; then
+    if is_checkout; then
+      if GIT_TERMINAL_PROMPT=0 git -C "$APP" ls-remote --exit-code origin HEAD >/dev/null 2>&1 </dev/null; then
+        report ok "repo access" "can read $(git -C "$APP" remote get-url origin 2>/dev/null || echo origin)"
+      else
+        report warn "repo access" "cannot reach the DemoReel repo, so update will fail. Fix: $NO_ACCESS"
+      fi
+    elif GIT_TERMINAL_PROMPT=0 git ls-remote --exit-code "$REPO_SSH" HEAD >/dev/null 2>&1 </dev/null ||
+      GIT_TERMINAL_PROMPT=0 git ls-remote --exit-code "$REPO_HTTPS" HEAD >/dev/null 2>&1 </dev/null; then
+      report ok "repo access" "can read the DemoReel repo"
+    else
+      report warn "repo access" "cannot read the DemoReel repo. Fix: $NO_ACCESS"
+    fi
+  fi
+
+  say ""
+  if [ "$DOCTOR_FAILED" = 0 ]; then
+    say "Everything a presentation render needs is ready."
+    return 0
+  fi
+  say "Something a render needs is missing; follow the Fix on each missing line, then run demoreel-studio doctor again."
+  return 1
+}
+
+cmd_doctor() {
+  [ $# -eq 0 ] || usage_error "doctor takes no options."
+  tool_env
+  doctor_report
+}
+
+parse_port() {
+  case "$1" in
+    '' | *[!0-9]*) usage_error "The port must be a number from 1 to 65535, got \"$1\"." ;;
+  esac
+  if [ "$1" -lt 1 ] || [ "$1" -gt 65535 ]; then usage_error "The port must be a number from 1 to 65535, got \"$1\"."; fi
+  printf '%s\n' "$1"
+}
+
+# Reads Studio's output (shown as is and kept in the log), opens the STUDIO_URL line once, and exits 0 if it saw it.
+watch_studio() {
+  trap '' INT # Ctrl-C is Studio's to handle; keep reading until it has stopped
+  local log=$1 line url="" seen=1
+  while IFS= read -r line; do
+    printf '%s\n' "$line"
+    printf '%s\n' "$line" >>"$log"
+    case "$line" in
+      STUDIO_URL=*)
+        if [ -z "$url" ]; then
+          url=${line#STUDIO_URL=}
+          printf '%s\n' "$url" >"$URL_FILE"
+          if open "$url" >/dev/null 2>&1; then
+            say "Studio is ready at $url and opened in your browser; press Ctrl-C to stop it."
+          else
+            say "Studio is ready; open $url in your browser, and press Ctrl-C to stop it."
+          fi
+          seen=0
+        fi
+        ;;
+    esac
+  done
+  return "$seen"
+}
+
+cmd_start() {
+  local port="${STUDIO_PORT:-4400}"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --port)
+        [ $# -ge 2 ] || usage_error "--port needs a number."
+        port=$2
+        shift
+        ;;
+      --port=*) port=${1#--port=} ;;
+      *) usage_error "Unknown option $1 for start; run demoreel-studio --help to see the options." ;;
+    esac
+    shift
+  done
+  port="$(parse_port "$port")"
+  setup_complete || die "DemoReel is not set up yet; run demoreel-studio setup first."
+  if port_busy "$port"; then
+    if [ -f "$URL_FILE" ] && [ "$(cat "$URL_FILE")" = "http://127.0.0.1:$port" ]; then
+      die "Studio is already running at http://127.0.0.1:$port; run demoreel-studio open to see it, or pass --port <number> to start another one."
+    fi
+    die "Port $port is already in use; run demoreel-studio start --port $((port == 65535 ? 4401 : port + 1)) or another free number."
+  fi
+  tool_env
+  mkdir -p "$RUN_DIR" "$LOGS"
+  local log="$LOGS/studio.log"
+  : >"$log"
+  say "Starting Studio on port $port from $APP."
+  trap 'rm -f "$URL_FILE"' EXIT
+  trap ':' INT # wait for Studio to stop on Ctrl-C instead of leaving it behind
+  set +e
+  (cd "$APP" && STUDIO_PORT="$port" exec pnpm --filter @demoreel/studio start) 2>&1 | watch_studio "$log"
+  local statuses=("${PIPESTATUS[@]}")
+  set -e
+  if [ "${statuses[1]}" != 0 ]; then
+    die "Studio stopped before it was ready; the lines above say why, and the full output is in $log."
+  fi
+  say "Studio stopped."
+}
+
+cmd_open() {
+  [ $# -eq 0 ] || usage_error "open takes no options."
+  local url port
+  if [ -f "$URL_FILE" ]; then
+    url="$(cat "$URL_FILE")"
+    port=${url##*:}
+    if port_busy "$port"; then
+      open "$url" >/dev/null 2>&1 || die "Could not open a browser; open $url yourself."
+      say "Opened $url."
+      return 0
+    fi
+  fi
+  die "Studio is not running; start it with demoreel-studio start."
+}
+
+cmd_where() {
+  say "Install home:  $DR_HOME"
+  say "Checkout:      $APP"
+  say "State folder:  $APP/renders/studio"
+  say "Secrets file:  $SECRETS_FILE"
+  say "Browsers:      $BROWSERS"
+  say "Logs:          $LOGS"
+}
+
+cmd_version() {
+  say "demoreel-studio $LAUNCHER_VERSION"
+  if is_checkout && have git; then
+    say "Checkout: $APP on $(git -C "$APP" rev-parse --abbrev-ref HEAD 2>/dev/null || true) at $(head_commit)"
+  else
+    say "Checkout: not set up yet (run demoreel-studio setup)"
+  fi
+}
+
+usage() {
+  cat <<EOF
+demoreel-studio $LAUNCHER_VERSION: install, update and start DemoReel Studio on this Mac.
+
+Commands:
+  demoreel-studio                  Set up if needed, then start Studio and open it in the browser.
+  demoreel-studio setup [--no-kokoro] [--branch <name>]
+                                   Clone or update the repo, install, build, add Chromium and the Kokoro voice,
+                                   ask for the Claude key, then run doctor. Safe to run again.
+  demoreel-studio start [--port <n>]
+                                   Start Studio (port 4400 unless --port or STUDIO_PORT), open it, Ctrl-C stops it.
+  demoreel-studio doctor           Check every piece and say how to fix what is missing; installs nothing.
+  demoreel-studio update           Pull the latest main (fast-forward only), reinstall and rebuild what changed.
+  demoreel-studio open             Open the running Studio in the browser.
+  demoreel-studio where            Show where the checkout, state, key and logs live.
+  demoreel-studio version          Show the launcher version and the checkout's commit.
+
+Everything lives in $DR_HOME (set DEMOREEL_HOME to use another folder).
+EOF
+}
+
+main() {
+  local cmd="${1:-}"
+  case "$cmd" in
+    "" | --port | --port=*)
+      if ! setup_complete; then cmd_setup; fi
+      cmd_start "$@"
+      ;;
+    setup) shift; cmd_setup "$@" ;;
+    start) shift; cmd_start "$@" ;;
+    doctor) shift; cmd_doctor "$@" ;;
+    update) shift; cmd_update "$@" ;;
+    open) shift; cmd_open "$@" ;;
+    where) cmd_where ;;
+    version | --version | -v) cmd_version ;;
+    help | --help | -h) usage ;;
+    *) usage_error "Unknown command \"$cmd\"; run demoreel-studio --help to see the commands." ;;
+  esac
+}
+
+main "$@"
