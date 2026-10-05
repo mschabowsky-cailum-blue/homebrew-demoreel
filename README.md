@@ -3,9 +3,14 @@
 Homebrew tap for `demoreel-studio`, the launcher that installs and starts DemoReel Studio on your own Mac.
 
 ```sh
-brew install mschabowsky-cailum-blue/demoreel/demoreel-studio
+brew tap mschabowsky-cailum-blue/demoreel
+brew trust --formula mschabowsky-cailum-blue/demoreel/demoreel-studio
+brew install demoreel-studio
 demoreel-studio
 ```
+
+Homebrew 7 refuses formulas from third-party taps until you trust them; the `brew trust` line allows this one
+formula only.
 
 The formula installs only the launcher and the tools it needs (Node 22, pnpm, git, ffmpeg, tesseract, uv). The
 DemoReel code itself is private: the first run of `demoreel-studio` clones it into `~/.demoreel/app` with your own
