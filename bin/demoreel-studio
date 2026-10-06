@@ -13,7 +13,7 @@
 #   run/       the URL of the running Studio (for `open`)
 set -euo pipefail
 
-LAUNCHER_VERSION="0.1.0"
+LAUNCHER_VERSION="0.1.1"
 REPO_SSH="git@github.com:mschabowsky-cailum-blue/video-demo-creator.git"
 REPO_HTTPS="https://github.com/mschabowsky-cailum-blue/video-demo-creator.git"
 NO_ACCESS="Ask Matt for read access to the DemoReel repo, then run demoreel-studio setup again."

@@ -12,7 +12,7 @@ demoreel-studio
 Homebrew 7 refuses formulas from third-party taps until you trust them; the `brew trust` line allows this one
 formula only.
 
-The formula installs only the launcher and the tools it needs (Node 22, pnpm, git, ffmpeg, tesseract, uv). The
+The formula installs only the launcher and the tools it needs (Node 22, pnpm, git, ffmpeg-full for burned-in captions, tesseract, uv). The
 DemoReel code itself is private: the first run of `demoreel-studio` clones it into `~/.demoreel/app` with your own
 GitHub access (ask Matt for read access), installs its packages, Chromium and the Kokoro voice (about 3 GB, a few
 minutes), asks for your Claude API key and opens Studio in your browser.
