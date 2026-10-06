@@ -13,7 +13,7 @@
 #   run/       the URL of the running Studio (for `open`)
 set -euo pipefail
 
-LAUNCHER_VERSION="0.1.1"
+LAUNCHER_VERSION="0.1.2"
 REPO_SSH="git@github.com:mschabowsky-cailum-blue/video-demo-creator.git"
 REPO_HTTPS="https://github.com/mschabowsky-cailum-blue/video-demo-creator.git"
 NO_ACCESS="Ask Matt for read access to the DemoReel repo, then run demoreel-studio setup again."
@@ -57,11 +57,21 @@ port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/$1") >/dev/null 2>&1; }
 
 in_app() { (cd "$APP" && "$@"); }
 
-conf_voice() {
-  if [ -f "$CONF" ]; then sed -n 's/^voice=//p' "$CONF" | sed -n '$p'; fi
+# launcher.conf holds one key=value per line (voice=kokoro|none, office=yes|none); the last line of a key wins.
+conf_get() {
+  if [ -f "$CONF" ]; then sed -n "s/^$1=//p" "$CONF" | sed -n '$p'; fi
 }
 
-set_conf_voice() { mkdir -p "$DR_HOME" && printf 'voice=%s\n' "$1" >"$CONF"; }
+conf_set() {
+  mkdir -p "$DR_HOME"
+  local rest=""
+  if [ -f "$CONF" ]; then rest="$(grep -v "^$1=" "$CONF" || true)"; fi
+  { if [ -n "$rest" ]; then printf '%s\n' "$rest"; fi; printf '%s=%s\n' "$1" "$2"; } >"$CONF.tmp" && mv "$CONF.tmp" "$CONF"
+}
+
+conf_voice() { conf_get voice; }
+
+set_conf_voice() { conf_set voice "$1"; }
 
 is_checkout() { [ -d "$APP/.git" ]; }
 
@@ -235,6 +245,30 @@ ensure_kokoro() {
   set_conf_voice kokoro
 }
 
+# LibreOffice turns a PowerPoint deck with no PDF beside it into slides. Homebrew formulas cannot depend on a cask,
+# so setup installs it here. A failure is not fatal: a deck exported to PDF works without it.
+ensure_libreoffice() {
+  if libreoffice_present; then
+    skip_step "Installing LibreOffice for PowerPoint decks" "skipped, already installed"
+    conf_set office yes
+    return 0
+  fi
+  if ! have brew; then
+    say "Installing LibreOffice for PowerPoint decks ... skipped, Homebrew is not on PATH. Until it is installed, export a PowerPoint deck to PDF first."
+    return 0
+  fi
+  local t0=$SECONDS
+  printf 'Installing LibreOffice for PowerPoint decks (about 1 GB, a few minutes) ... '
+  printf '\n== Installing LibreOffice\n' >>"$LOG_FILE"
+  if HOMEBREW_NO_AUTO_UPDATE=1 brew install --cask libreoffice >>"$LOG_FILE" 2>&1 </dev/null; then
+    say "done ($((SECONDS - t0)) s)."
+    conf_set office yes
+  else
+    say "failed."
+    say "LibreOffice could not be installed (the log $LOG_FILE says why). Until it is, export a PowerPoint deck to PDF first; to try again, run demoreel-studio setup."
+  fi
+}
+
 save_key() {
   local key=""
   printf 'Paste your Claude API key and press Return (it is not shown), or just press Return to skip: '
@@ -273,10 +307,11 @@ ensure_key() {
 
 # shellcheck disable=SC2120 # the bare command calls it with no options; `setup` passes them
 cmd_setup() {
-  local no_kokoro=0 branch=""
+  local no_kokoro=0 no_office=0 branch=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --no-kokoro) no_kokoro=1 ;;
+      --no-libreoffice) no_office=1 ;;
       --branch)
         [ $# -ge 2 ] || usage_error "setup --branch needs a branch name."
         branch=$2
@@ -301,6 +336,12 @@ cmd_setup() {
     if [ ! -d "$APP/.venv-kokoro" ]; then set_conf_voice none; fi
   else
     ensure_kokoro
+  fi
+  if [ "$no_office" = 1 ]; then
+    skip_step "Installing LibreOffice for PowerPoint decks" "skipped because of --no-libreoffice"
+    if ! libreoffice_present; then conf_set office none; fi
+  else
+    ensure_libreoffice
   fi
   ensure_key
   mkdir -p "$STATE" && printf '%s\n' "$(head_commit)" >"$STATE/setup-complete"
@@ -395,7 +436,8 @@ doctor_report() {
   fi
 
   if libreoffice_present; then report ok libreoffice "found"
-  else report warn libreoffice "not installed; only a PPTX without a PDF beside it needs it. Fix: brew install --cask libreoffice"; fi
+  elif [ "$(conf_get office)" = "none" ]; then report warn libreoffice "skipped by setup --no-libreoffice; a PowerPoint deck needs a PDF beside it. Fix: demoreel-studio setup"
+  else report warn libreoffice "not installed; only a PowerPoint deck without a PDF beside it needs it. Fix: demoreel-studio setup (or brew install --cask libreoffice)"; fi
 
   if key_present; then
     mode="$(file_mode "$SECRETS_FILE")"
@@ -546,9 +588,10 @@ demoreel-studio $LAUNCHER_VERSION: install, update and start DemoReel Studio on 
 
 Commands:
   demoreel-studio                  Set up if needed, then start Studio and open it in the browser.
-  demoreel-studio setup [--no-kokoro] [--branch <name>]
-                                   Clone or update the repo, install, build, add Chromium and the Kokoro voice,
-                                   ask for the Claude key, then run doctor. Safe to run again.
+  demoreel-studio setup [--no-kokoro] [--no-libreoffice] [--branch <name>]
+                                   Clone or update the repo, install, build, add Chromium, the Kokoro voice and
+                                   LibreOffice (for PowerPoint decks), ask for the Claude key, then run doctor.
+                                   Safe to run again.
   demoreel-studio start [--port <n>]
                                    Start Studio (port 4400 unless --port or STUDIO_PORT), open it, Ctrl-C stops it.
   demoreel-studio doctor           Check every piece and say how to fix what is missing; installs nothing.
