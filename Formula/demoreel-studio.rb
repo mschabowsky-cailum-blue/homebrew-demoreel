@@ -7,7 +7,7 @@ class DemoreelStudio < Formula
   desc "Installs, updates and starts DemoReel Studio from the private DemoReel repo"
   homepage "https://github.com/mschabowsky-cailum-blue/homebrew-demoreel"
   url "https://github.com/mschabowsky-cailum-blue/homebrew-demoreel/archive/refs/tags/v0.1.1.tar.gz"
-  sha256 "ca75bb7d8bc126edce41edcb6d1d4bb085b035515f5cb610c64eda064d8b77f5"
+  sha256 "d468f6a733a09ee626038b2d144ed745ee22eedd57b2f5dda27fbe9cfeb7f968"
   license :cannot_represent
 
   depends_on "ffmpeg-full"
